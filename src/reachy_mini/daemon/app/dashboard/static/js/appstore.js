@@ -5,7 +5,10 @@ const hfAppsStore = {
         await hfAppsStore.displayAvailableApps(appsData);
     },
     fetchAvailableApps: async () => {
-        const resAvailable = await fetch('/api/apps/list-available/dashboard_selection');
+        // Decide which source to query based on the toggle state.
+        const includeCommunity = document.getElementById('hf-show-community')?.checked === true;
+        const source = includeCommunity ? 'hf_space' : 'dashboard_selection';
+        const resAvailable = await fetch(`/api/apps/list-available/${source}`);
         const appsData = await resAvailable.json();
         return appsData;
     },
@@ -48,7 +51,16 @@ const hfAppsStore = {
         hfApps.forEach(app => {
             const li = document.createElement('li');
             li.className = 'app-list-item';
-            const isInstalled = installedApps.some(installedApp => installedApp.name === app.name);
+            const isInstalled = installedApps.some(installedApp => {
+                // Match by HuggingFace space ID (extra.id) - most reliable
+                if (installedApp.extra?.id && app.extra?.id) {
+                    if (installedApp.extra.id === app.extra.id) {
+                        return true;
+                    }
+                }
+                // Fallback: direct name match
+                return installedApp.name === app.name;
+            });
             li.appendChild(hfAppsStore.createAppElement(app, isInstalled));
             appsListElement.appendChild(li);
         });
@@ -149,9 +161,184 @@ const hfAppsStore = {
             installedApps.refreshAppList();
         };
     },
+
+    // Advanced functionality for private spaces
+    advanced: {
+        isAuthenticated: false,
+        username: null,
+
+        init: async () => {
+            // Initialize advanced section for all versions (wireless and Lite)
+            try {
+                // Show the advanced section
+                document.getElementById('hf-advanced-section').classList.remove('hidden');
+
+                // Set up event listeners
+                document.getElementById('hf-advanced-toggle').onclick = hfAppsStore.advanced.toggleSection;
+
+                const installBtn = document.getElementById('hf-install-private-button');
+                if (installBtn) {
+                    installBtn.onclick = hfAppsStore.advanced.installPrivateSpace;
+                }
+
+                // Add Enter key support for space ID input
+                const spaceIdInput = document.getElementById('hf-space-id-input');
+                if (spaceIdInput) {
+                    spaceIdInput.addEventListener('keypress', (e) => {
+                        if (e.key === 'Enter') {
+                            hfAppsStore.advanced.installPrivateSpace();
+                        }
+                    });
+                }
+
+                // Sync auth status with global hfAuth (after a small delay to let hfAuth init first)
+                setTimeout(() => {
+                    if (typeof hfAuth !== 'undefined') {
+                        hfAppsStore.advanced.isAuthenticated = hfAuth.isAuthenticated;
+                        hfAppsStore.advanced.username = hfAuth.username;
+                    }
+                    hfAppsStore.advanced.updateAuthUI();
+                }, 100);
+
+            } catch (error) {
+                console.error('Error initializing advanced section:', error);
+            }
+        },
+
+        toggleSection: () => {
+            const content = document.getElementById('hf-advanced-content');
+            const chevron = document.getElementById('hf-advanced-chevron');
+
+            if (content.classList.contains('hidden')) {
+                content.classList.remove('hidden');
+                chevron.style.transform = 'rotate(90deg)';
+            } else {
+                content.classList.add('hidden');
+                chevron.style.transform = 'rotate(0deg)';
+            }
+        },
+
+        updateAuthUI: () => {
+            const indicator = document.getElementById('hf-auth-indicator');
+            const authText = document.getElementById('hf-auth-text');
+            const loginForm = document.getElementById('hf-login-form');
+            const loggedInView = document.getElementById('hf-logged-in-view');
+
+            if (!indicator || !authText) return;
+
+            if (hfAppsStore.advanced.isAuthenticated) {
+                // Connected state
+                indicator.classList.remove('bg-gray-400');
+                indicator.classList.add('bg-green-500');
+                authText.textContent = `🤗 Connected as ${hfAppsStore.advanced.username || 'user'}`;
+                authText.style.color = '#065f46';
+                if (loginForm) loginForm.classList.add('hidden');
+                if (loggedInView) loggedInView.classList.remove('hidden');
+            } else {
+                // Not connected state
+                indicator.classList.remove('bg-green-500');
+                indicator.classList.add('bg-gray-400');
+                authText.textContent = 'Not connected';
+                authText.style.color = '#374151';
+                if (loginForm) loginForm.classList.remove('hidden');
+                if (loggedInView) loggedInView.classList.add('hidden');
+            }
+        },
+
+        installPrivateSpace: async () => {
+            const spaceIdInput = document.getElementById('hf-space-id-input');
+            const errorDiv = document.getElementById('hf-private-install-error');
+            const installButton = document.getElementById('hf-install-private-button');
+
+            const spaceId = spaceIdInput?.value.trim();
+
+            if (!spaceId) {
+                if (errorDiv) {
+                    errorDiv.textContent = 'Please enter a space ID';
+                    errorDiv.classList.remove('hidden');
+                }
+                return;
+            }
+
+            // Validate format (should be "username/space-name")
+            if (!spaceId.includes('/')) {
+                if (errorDiv) {
+                    errorDiv.textContent = 'Space ID should be in format: username/space-name';
+                    errorDiv.classList.remove('hidden');
+                }
+                return;
+            }
+
+            // Disable button during request
+            if (installButton) {
+                installButton.disabled = true;
+                installButton.textContent = 'Installing...';
+            }
+            if (errorDiv) {
+                errorDiv.classList.add('hidden');
+            }
+
+            try {
+                const response = await fetch('/api/apps/install-private-space', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ space_id: spaceId })
+                });
+
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || 'Installation failed');
+                }
+
+                const data = await response.json();
+                const jobId = data.job_id;
+
+                // Clear input
+                if (spaceIdInput) spaceIdInput.value = '';
+
+                // Show installation modal (reuse existing modal)
+                const spaceName = spaceId.split('/')[1];
+                hfAppsStore.appInstallLogHandler(spaceName, jobId);
+
+            } catch (error) {
+                if (error.message.includes('authenticate') || error.message.includes('401')) {
+                    // Token expired or invalid - update global auth state
+                    if (typeof hfAuth !== 'undefined') {
+                        hfAuth.isAuthenticated = false;
+                        hfAuth.username = null;
+                        hfAuth.updateHeaderUI();
+                    }
+                    hfAppsStore.advanced.isAuthenticated = false;
+                    hfAppsStore.advanced.username = null;
+                    hfAppsStore.advanced.updateAuthUI();
+                    if (errorDiv) {
+                        errorDiv.textContent = 'Authentication expired. Please login again from the header.';
+                    }
+                } else if (errorDiv) {
+                    errorDiv.textContent = error.message;
+                }
+                if (errorDiv) errorDiv.classList.remove('hidden');
+            } finally {
+                if (installButton) {
+                    installButton.disabled = false;
+                    installButton.textContent = 'Install Private Space';
+                }
+            }
+        },
+    },
 };
 
 
 window.addEventListener('load', async () => {
+    // Attach change listener to community toggle if present
+    const communityToggle = document.getElementById('hf-show-community');
+    if (communityToggle) {
+        communityToggle.addEventListener('change', async () => {
+            await hfAppsStore.refreshAppList();
+        });
+    }
     await hfAppsStore.refreshAppList();
+
+    // Initialize advanced section for private spaces
+    await hfAppsStore.advanced.init();
 });

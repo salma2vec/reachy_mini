@@ -149,6 +149,81 @@ def scan_wifi() -> list[str]:
     return ssids
 
 
+@router.post("/forget")
+def forget_wifi_network(ssid: str) -> None:
+    """Forget a saved WiFi network. Falls back to Hotspot if forgetting the active network."""
+    if ssid == "Hotspot":
+        raise HTTPException(status_code=400, detail="Cannot forget Hotspot connection.")
+
+    if not check_if_connection_exists(ssid):
+        raise HTTPException(
+            status_code=404, detail=f"Network '{ssid}' not found in saved networks."
+        )
+
+    if busy_lock.locked():
+        raise HTTPException(status_code=409, detail="Another operation is in progress.")
+
+    def forget() -> None:
+        global error
+        with busy_lock:
+            try:
+                error = None
+                was_active = check_if_connection_active(ssid)
+                logger.info(f"Forgetting WiFi network '{ssid}'...")
+                remove_connection(ssid)
+
+                if was_active:
+                    logger.info("Was connected, falling back to hotspot...")
+                    setup_wifi_connection(
+                        name="Hotspot",
+                        ssid=HOTSPOT_SSID,
+                        password=HOTSPOT_PASSWORD,
+                        is_hotspot=True,
+                    )
+            except Exception as e:
+                error = e
+                logger.error(f"Failed to forget network '{ssid}': {e}")
+
+    Thread(target=forget).start()
+
+
+@router.post("/forget_all")
+def forget_all_wifi_networks() -> None:
+    """Forget all saved WiFi networks (except Hotspot). Falls back to Hotspot."""
+    if busy_lock.locked():
+        raise HTTPException(status_code=409, detail="Another operation is in progress.")
+
+    def forget_all() -> None:
+        global error
+        with busy_lock:
+            try:
+                error = None
+                connections = get_wifi_connections()
+                forgotten = []
+
+                for conn in connections:
+                    if conn.name != "Hotspot":
+                        remove_connection(conn.name)
+                        forgotten.append(conn.name)
+
+                logger.info(f"Forgotten {len(forgotten)} networks: {forgotten}")
+
+                # Always ensure we have connectivity after forgetting all
+                if get_current_wifi_mode() == WifiMode.DISCONNECTED:
+                    logger.info("No connection left, setting up hotspot...")
+                    setup_wifi_connection(
+                        name="Hotspot",
+                        ssid=HOTSPOT_SSID,
+                        password=HOTSPOT_PASSWORD,
+                        is_hotspot=True,
+                    )
+            except Exception as e:
+                error = e
+                logger.error(f"Failed to forget networks: {e}")
+
+    Thread(target=forget_all).start()
+
+
 # NMCLI WRAPPERS
 def scan_available_wifi() -> list[nmcli.data.device.DeviceWifi]:
     """Scan for available WiFi networks."""
@@ -202,18 +277,53 @@ def remove_connection(name: str) -> None:
         nmcli.connection.delete(name)
 
 
-# Setup WiFi connection on startup
+WIFI_INIT_MAX_RETRIES = 5
+WIFI_INIT_RETRY_DELAY = 3  # seconds
+WIFI_INIT_TIMEOUT = 30  # seconds
 
-# This make sure the wlan0 is up and running
-scan_available_wifi()
 
-# On startup, if no WiFi connection is active, set up the default hotspot
-if get_current_wifi_mode() == WifiMode.DISCONNECTED:
-    logger.info("No WiFi connection active. Setting up hotspot...")
+def ensure_wifi_on_startup() -> None:
+    """Ensure WiFi is configured on daemon startup.
 
-    setup_wifi_connection(
-        name="Hotspot",
-        ssid=HOTSPOT_SSID,
-        password=HOTSPOT_PASSWORD,
-        is_hotspot=True,
+    Retries if NetworkManager or the WiFi interface isn't ready yet.
+    On final failure the daemon keeps running so the robot stays
+    reachable via Bluetooth for recovery.
+    """
+    import time
+
+    for attempt in range(1, WIFI_INIT_MAX_RETRIES + 1):
+        try:
+            # Make sure wlan0 is up and running
+            scan_available_wifi()
+
+            # If no WiFi connection is active, set up the default hotspot
+            if get_current_wifi_mode() == WifiMode.DISCONNECTED:
+                logger.info("No WiFi connection active. Setting up hotspot...")
+                setup_wifi_connection(
+                    name="Hotspot",
+                    ssid=HOTSPOT_SSID,
+                    password=HOTSPOT_PASSWORD,
+                    is_hotspot=True,
+                )
+            return
+        except Exception as e:
+            logger.warning(
+                f"WiFi init attempt {attempt}/{WIFI_INIT_MAX_RETRIES} failed: {e}"
+            )
+            if attempt < WIFI_INIT_MAX_RETRIES:
+                time.sleep(WIFI_INIT_RETRY_DELAY)
+
+    logger.error(
+        f"WiFi initialization failed after {WIFI_INIT_MAX_RETRIES} attempts. "
+        "Daemon will start without WiFi configured."
+    )
+
+
+_wifi_init_thread = Thread(target=ensure_wifi_on_startup, daemon=True)
+_wifi_init_thread.start()
+_wifi_init_thread.join(timeout=WIFI_INIT_TIMEOUT)
+if _wifi_init_thread.is_alive():
+    logger.error(
+        f"WiFi initialization timed out after {WIFI_INIT_TIMEOUT}s. "
+        "Daemon will start without WiFi configured."
     )

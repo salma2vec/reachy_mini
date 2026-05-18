@@ -1,34 +1,116 @@
-"""Audio implementation using sounddevice backend."""
+"""Audio implementation using sounddevice backend.
 
-import os
-import threading
-from typing import Any, List, Optional
+This module provides a cross-platform audio implementation using the sounddevice
+library. It supports microphone input, speaker output, and sound file playback
+across different operating systems (Windows, macOS, Linux).
 
-import numpy as np
-import numpy.typing as npt
-import scipy
-import sounddevice as sd
-import soundfile as sf
+The sounddevice backend features:
+- Cross-platform compatibility
+- Low-latency audio processing
+- Support for multiple audio devices
+- Sound file playback (WAV, OGG, FLAC, etc.)
+- Automatic sample rate and channel conversion
+- Thread-safe audio buffer management
 
-from reachy_mini.utils.constants import ASSETS_ROOT_PATH
+Note:
+    This class is typically used internally by the MediaManager when the DEFAULT
+    backend is selected. Direct usage is possible but usually not necessary.
 
-from .audio_base import AudioBase
+Example usage via MediaManager:
+    >>> from reachy_mini.media.media_manager import MediaManager, MediaBackend
+    >>>
+    >>> # Create media manager with sounddevice backend (default)
+    >>> media = MediaManager(backend=MediaBackend.DEFAULT, log_level="INFO")
+    >>>
+    >>> # Start audio recording
+    >>> media.start_recording()
+    >>>
+    >>> # Get audio samples
+    >>> samples = media.get_audio_sample()
+    >>> if samples is not None:
+    ...     print(f"Captured {len(samples)} audio samples")
+    >>>
+    >>> # Play a sound file
+    >>> media.play_sound("/path/to/sound.wav")
+    >>>
+    >>> # Clean up
+    >>> media.stop_recording()
+    >>> media.close()
+
+"""
+
+import warnings
+
+warnings.warn(
+    "The 'reachy_mini.media.audio_sounddevice' module is deprecated and will be removed in a future version. "
+    "Use MediaManager with MediaBackend.GSTREAMER or MediaBackend.GSTREAMER_NO_VIDEO instead.",
+    FutureWarning,
+    stacklevel=2,
+)
+
+try:
+    import sounddevice as sd
+    import soundfile as sf
+except ImportError as e:
+    raise ImportError(
+        "The 'sounddevice' and 'soundfile' modules are required for SoundDeviceAudio but could not be imported. "
+        "Please install the optional 'sounddevice' dependencies with:\n  pip install .[sounddevice]"
+    ) from e
+
+import os  # noqa: E402
+import threading  # noqa: E402
+from collections import deque  # noqa: E402
+from typing import Deque, List, Optional  # noqa: E402
+
+import numpy as np  # noqa: E402
+import numpy.typing as npt  # noqa: E402
+import scipy  # noqa: E402
+
+from reachy_mini.utils.constants import ASSETS_ROOT_PATH  # noqa: E402
+
+from .audio_base import AudioBase  # noqa: E402
+
+MAX_INPUT_CHANNELS = 4
+MAX_INPUT_QUEUE_SECONDS = 60.0
 
 
 class SoundDeviceAudio(AudioBase):
-    """Audio device implementation using sounddevice."""
+    """Audio device implementation using sounddevice.
+
+    This class implements the AudioBase interface using the sounddevice library,
+    providing cross-platform audio capture and playback capabilities.
+
+    Attributes:
+        Inherits all attributes from AudioBase.
+        Additionally manages sounddevice streams and audio buffers.
+
+    """
 
     def __init__(
         self,
-        frames_per_buffer: int = 256,
         log_level: str = "INFO",
     ) -> None:
-        """Initialize the SoundDevice audio device."""
+        """Initialize the SoundDevice audio device.
+
+        Args:
+            log_level (str): Logging level for audio operations.
+                          Default: 'INFO'.
+
+        Note:
+            This constructor initializes the sounddevice audio system and sets up
+            the necessary audio streams for recording and playback.
+
+        """
         super().__init__(log_level=log_level)
-        self.frames_per_buffer = frames_per_buffer
-        self.stream = None
+        self._input_stream = None
         self._output_stream = None
-        self._buffer: List[npt.NDArray[np.float32]] = []
+        self._input_lock = threading.Lock()
+        self._output_lock = threading.Lock()
+        self._input_buffer: Deque[npt.NDArray[np.float32]] = deque()
+        self._output_buffer: List[npt.NDArray[np.float32]] = []
+        self._input_max_queue_seconds: float = MAX_INPUT_QUEUE_SECONDS
+        self._input_queued_samples: int = 0
+
         self._output_device_id = self._get_device_id(
             ["Reachy Mini Audio", "respeaker"], device_io_type="output"
         )
@@ -36,99 +118,255 @@ class SoundDeviceAudio(AudioBase):
             ["Reachy Mini Audio", "respeaker"], device_io_type="input"
         )
 
-    def start_recording(self) -> None:
-        """Open the audio input stream, using ReSpeaker card if available."""
-        self.stream = sd.InputStream(
-            blocksize=self.frames_per_buffer,
-            device=self._input_device_id,
-            callback=self._callback,
-            samplerate=self.get_input_audio_samplerate(),
-        )
-        if self.stream is None:
-            raise RuntimeError("Failed to open SoundDevice audio stream.")
-        self._buffer.clear()
-        self.stream.start()
-        self.logger.info("SoundDevice audio stream opened.")
+        self._logs = {
+            "input_underflows": 0,
+            "input_overflows": 0,
+        }
 
-    def _callback(
+    @property
+    def _input_max_queue_samples(self) -> int:
+        return int(self._input_max_queue_seconds * self.get_input_audio_samplerate())
+
+    @property
+    def _is_recording(self) -> bool:
+        return self._input_stream is not None and self._input_stream.active
+
+    def start_recording(self) -> None:
+        """Open the audio input stream, using ReSpeaker card if available.
+
+        See AudioBase.start_recording() for complete documentation.
+        """
+        if self._is_recording:
+            self.stop_recording()
+
+        self._input_stream = sd.InputStream(
+            device=self._input_device_id,
+            samplerate=self.get_input_audio_samplerate(),
+            callback=self._input_callback,
+        )
+        if self._input_stream is None:
+            raise RuntimeError("Failed to open SoundDevice audio input stream.")
+
+        self._input_buffer.clear()
+        self._input_queued_samples = 0
+        self._input_stream.start()
+        self.logger.info("SoundDevice audio input stream opened.")
+
+    def _input_callback(
         self,
         indata: npt.NDArray[np.float32],
         frames: int,
         time: int,
         status: sd.CallbackFlags,
     ) -> None:
-        if status:
-            self.logger.warning(f"SoundDevice status: {status}")
+        if status and status.input_underflow:
+            self._logs["input_underflows"] += 1
+            if self._logs["input_underflows"] % 10 == 1:
+                self.logger.debug(
+                    f"Audio input underflow count: {self._logs['input_underflows']}"
+                )
 
-        self._buffer.append(indata.copy())
+        with self._input_lock:
+            if (
+                self._input_queued_samples + indata.shape[0]
+                > self._input_max_queue_samples
+            ):
+                while (
+                    self._input_queued_samples + indata.shape[0]
+                    > self._input_max_queue_samples
+                    and len(self._input_buffer) > 0
+                ):
+                    dropped = self._input_buffer.popleft()
+                    self._input_queued_samples -= dropped.shape[0]
+                self._logs["input_overflows"] += 1
+                self.logger.warning(
+                    "Audio input buffer overflowed, dropped old chunks !"
+                )
+            self._input_buffer.append(indata[:, :MAX_INPUT_CHANNELS].copy())
+            self._input_queued_samples += indata.shape[0]
 
     def get_audio_sample(self) -> Optional[npt.NDArray[np.float32]]:
-        """Read audio data from the buffer. Returns numpy array or None if empty."""
-        if self._buffer and len(self._buffer) > 0:
-            data: npt.NDArray[np.float32] = np.concatenate(self._buffer, axis=0)
-            self._buffer.clear()
-            return data
+        """Read audio data from the buffer. Returns numpy array or None if empty.
+
+        See AudioBase.get_audio_sample() for complete documentation.
+        """
+        with self._input_lock:
+            if self._input_buffer and len(self._input_buffer) > 0:
+                data: npt.NDArray[np.float32] = np.concatenate(
+                    self._input_buffer, axis=0
+                )
+                self._input_buffer.clear()
+                self._input_queued_samples = 0
+                return data
         self.logger.debug("No audio data available in buffer.")
         return None
 
     def get_input_audio_samplerate(self) -> int:
-        """Get the input samplerate of the audio device."""
+        """Get the input samplerate of the audio device.
+
+        See AudioBase.get_input_audio_samplerate() for complete documentation.
+        """
         return int(
             sd.query_devices(self._input_device_id, "input")["default_samplerate"]
         )
 
     def get_output_audio_samplerate(self) -> int:
-        """Get the output samplerate of the audio device."""
+        """Get the output samplerate of the audio device.
+
+        See AudioBase.get_output_audio_samplerate() for complete documentation.
+        """
         return int(
             sd.query_devices(self._output_device_id, "output")["default_samplerate"]
         )
 
+    def get_input_channels(self) -> int:
+        """Get the number of input channels of the audio device.
+
+        See AudioBase.get_input_channels() for complete documentation.
+        """
+        return min(
+            int(sd.query_devices(self._input_device_id, "input")["max_input_channels"]),
+            MAX_INPUT_CHANNELS,
+        )
+
+    def get_output_channels(self) -> int:
+        """Get the number of output channels of the audio device.
+
+        See AudioBase.get_output_channels() for complete documentation.
+        """
+        return int(
+            sd.query_devices(self._output_device_id, "output")["max_output_channels"]
+        )
+
     def stop_recording(self) -> None:
-        """Close the audio stream and release resources."""
-        if self.stream is not None:
-            self.stream.stop()
-            self.stream.close()
-            self.stream = None
+        """Close the audio stream and release resources.
+
+        See AudioBase.stop_recording() for complete documentation.
+        """
+        if self._is_recording:
+            self._input_stream.stop()  # type: ignore[attr-defined]
+            self._input_stream.close()  # type: ignore[attr-defined]
+            self._input_stream = None
             self.logger.info("SoundDevice audio stream closed.")
 
     def push_audio_sample(self, data: npt.NDArray[np.float32]) -> None:
-        """Push audio data to the output device."""
+        """Push audio data to the output device.
+
+        See AudioBase.push_audio_sample() for complete documentation.
+        """
         if self._output_stream is not None:
-            if data.ndim > 1:  # convert to mono
-                data = np.mean(data, axis=1)
-            self._output_stream.write(data)
+            with self._output_lock:
+                self._output_buffer.append(data.copy())
         else:
             self.logger.warning(
                 "Output stream is not open. Call start_playing() first."
             )
 
+    def clear_output_buffer(self) -> None:
+        """Clear the output buffer."""
+        with self._output_lock:
+            self._output_buffer.clear()
+
+    def set_max_output_buffers(self, max_buffers: int) -> None:
+        """Set the maximum number of output buffers to queue in the player.
+
+        Args:
+            max_buffers (int): Maximum number of buffers to queue.
+
+        """
+        self.logger.warning(
+            "set_max_output_buffers is not implemented for SoundDeviceAudio."
+        )
+
     def start_playing(self) -> None:
-        """Open the audio output stream."""
+        """Open the audio output stream.
+
+        See AudioBase.start_playing() for complete documentation.
+        """
+        self.clear_output_buffer()
+
         if self._output_stream is not None:
             self.stop_playing()
         self._output_stream = sd.OutputStream(
             samplerate=self.get_output_audio_samplerate(),
             device=self._output_device_id,
-            channels=1,
+            callback=self._output_callback,
         )
         if self._output_stream is None:
             raise RuntimeError("Failed to open SoundDevice audio output stream.")
         self._output_stream.start()
+        self.logger.info("SoundDevice audio output stream opened.")
+
+    def _output_callback(
+        self,
+        outdata: npt.NDArray[np.float32],
+        frames: int,
+        time: int,
+        status: sd.CallbackFlags,
+    ) -> None:
+        """Handle audio output stream callback."""
+        if status:
+            self.logger.warning(f"SoundDevice output status: {status}")
+
+        with self._output_lock:
+            filled = 0
+            while filled < frames and self._output_buffer:
+                chunk = self._output_buffer[0]
+
+                needed = frames - filled
+                available = len(chunk)
+                take = min(needed, available)
+
+                outdata[filled : filled + take] = chunk[:take]
+                filled += take
+
+                if take < available:
+                    # Partial consumption, keep remainder
+                    self._output_buffer[0] = chunk[take:]
+                else:
+                    # Fully consumed this chunk
+                    self._output_buffer.pop(0)
+
+            # Only pad with zeros if buffer is truly empty
+            if filled < frames:
+                outdata[filled:] = 0
+
+    def ensure_chunk_shape(
+        self, chunk: npt.NDArray[np.float32], target_shape: tuple[int, ...]
+    ) -> npt.NDArray[np.float32]:
+        """Ensure chunk has the shape (frames, num_channels) as required by outdata.
+
+        - If chunk is 1D, tile to required num_channels.
+        - If chunk is 2D with mismatched channels, use column 0.
+        - If chunk is already correct, return as-is.
+        """
+        num_channels = target_shape[1] if len(target_shape) > 1 else 1
+        if chunk.ndim == 1:
+            return np.tile(chunk[:, None], (1, num_channels))
+        elif chunk.shape[1] != num_channels:
+            # Broadcast first channel only
+            return np.tile(chunk[:, [0]], (1, num_channels))
+        return chunk
 
     def stop_playing(self) -> None:
-        """Close the audio output stream."""
+        """Close the audio output stream.
+
+        See AudioBase.stop_playing() for complete documentation.
+        """
         if self._output_stream is not None:
             self._output_stream.stop()
             self._output_stream.close()
             self._output_stream = None
+            self.clear_output_buffer()
             self.logger.info("SoundDevice audio output stream closed.")
 
-    def play_sound(self, sound_file: str, autoclean: bool = False) -> None:
+    def play_sound(self, sound_file: str) -> None:
         """Play a sound file.
+
+        See AudioBase.play_sound() for complete documentation.
 
         Args:
             sound_file (str): Path to the sound file to play. May be given relative to the assets directory or as an absolute path.
-            autoclean (bool): If True, the audio device will be released after the sound is played.
 
         """
         if not os.path.exists(sound_file):
@@ -147,60 +385,18 @@ class SoundDeviceAudio(AudioBase):
             data = scipy.signal.resample(
                 data, int(len(data) * (samplerate_out / samplerate_in))
             )
-        if data.ndim > 1:  # convert to mono
-            data = np.mean(data, axis=1)
+        data = self.ensure_chunk_shape(data, (-1, self.get_output_channels()))
 
         self.logger.debug(f"Playing sound '{file_path}' at {samplerate_in} Hz")
 
-        self.stop_playing()
-        start = 0  # current position in audio data
-        length = len(data)
-
-        def callback(
-            outdata: npt.NDArray[np.float32],
-            frames: int,
-            time: Any,  # cdata 'struct PaStreamCallbackTimeInfo *
-            status: sd.CallbackFlags,
-        ) -> None:
-            """Actual playback."""
-            nonlocal start
-
-            if status:
-                self.logger.warning(f"SoundDevice output status: {status}")
-
-            end = start + frames
-            if end > length:
-                # Fill the output buffer with the audio data, or zeros if finished
-                outdata[: length - start, 0] = data[start:]
-                outdata[length - start :, 0] = 0
-                raise sd.CallbackStop()
-            else:
-                outdata[:, 0] = data[start:end]
-            start = end
-
-        stop_event = threading.Event()
-
-        self._output_stream = sd.OutputStream(
-            samplerate=samplerate_out,
-            device=self._output_device_id,
-            channels=1,
-            callback=callback,
-            finished_callback=stop_event.set,  # release the device when done
-        )
-        if self._output_stream is None:
-            raise RuntimeError("Failed to open SoundDevice audio output stream.")
-        self._output_stream.start()
-
-        if autoclean:
-
-            def _clean_up_thread() -> None:
-                stop_event.wait()
-                self.stop_playing()
-
-            threading.Thread(
-                target=_clean_up_thread,
-                daemon=True,
-            ).start()
+        if self._output_stream is not None:
+            self.push_audio_sample(data)
+        else:
+            self.logger.warning(
+                "Output stream wasn't open. We are opening it and leaving it open."
+            )
+            self.start_playing()
+            self.push_audio_sample(data)
 
     def _get_device_id(
         self, names_contains: List[str], device_io_type: str = "output"

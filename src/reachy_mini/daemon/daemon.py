@@ -21,10 +21,17 @@ from reachy_mini.daemon.utils import (
     find_serial_port,
     get_ip_address,
 )
+from reachy_mini.io import (
+    ZenohServer,
+)
+from reachy_mini.tools.reflash_motors import reflash_motors_if_needed
 
-from ..io.zenoh_server import ZenohServer
+from .backend.mockup_sim import MockupSimBackend, MockupSimBackendStatus
 from .backend.mujoco import MujocoBackend, MujocoBackendStatus
 from .backend.robot import RobotBackend, RobotBackendStatus
+
+# Central signaling relay for WebRTC (optional)
+_central_relay_task: Optional[asyncio.Task[Any]] = None
 
 
 class Daemon:
@@ -33,15 +40,24 @@ class Daemon:
     Runs the server with the appropriate backend (Mujoco for simulation or RobotBackend for real hardware).
     """
 
-    def __init__(self, log_level: str = "INFO", wireless_version: bool = False) -> None:
+    def __init__(
+        self,
+        log_level: str = "INFO",
+        robot_name: str = "reachy_mini",
+        wireless_version: bool = False,
+        desktop_app_daemon: bool = False,
+    ) -> None:
         """Initialize the Reachy Mini daemon."""
         self.log_level = log_level
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(self.log_level)
 
-        self.wireless_version = wireless_version
+        self.robot_name = robot_name
 
-        self.backend: "RobotBackend | MujocoBackend | None" = None
+        self.wireless_version = wireless_version
+        self.desktop_app_daemon = desktop_app_daemon
+
+        self.backend: "RobotBackend | MujocoBackend | MockupSimBackend | None" = None
         # Get package version
         try:
             package_version = version("reachy_mini")
@@ -51,9 +67,12 @@ class Daemon:
             self.logger.warning("Could not determine daemon version")
 
         self._status = DaemonStatus(
+            robot_name=robot_name,
             state=DaemonState.NOT_INITIALIZED,
             wireless_version=wireless_version,
+            desktop_app_daemon=desktop_app_daemon,
             simulation_enabled=None,
+            mockup_sim_enabled=None,
             backend_status=None,
             error=None,
             wlan_ip=None,
@@ -67,11 +86,65 @@ class Daemon:
         if wireless_version:
             from reachy_mini.media.webrtc_daemon import GstWebRTC
 
-            self._webrtc = GstWebRTC(log_level)
+            try:
+                self._webrtc = GstWebRTC(log_level)
+            except Exception as e:
+                self.logger.error(f"Failed to initialize WebRTC: {e}")
+                self._webrtc = None
+
+    def __del__(self) -> None:
+        """Destructor to ensure proper cleanup."""
+        self.logger.debug("Cleaning up Daemon resources...")
+        if self._webrtc is not None:
+            self._webrtc.stop()
+            self._webrtc.__del__()
+            self._webrtc = None
+
+    async def _start_central_signaling_relay(self) -> None:
+        """Start the central signaling relay for remote WebRTC access."""
+        global _central_relay_task
+
+        if not self._webrtc:
+            return
+
+        try:
+            from huggingface_hub import get_token
+
+            hf_token = get_token()
+        except Exception as e:
+            self.logger.debug(f"No HF token available, central signaling disabled: {e}")
+            return
+
+        if not hf_token:
+            self.logger.info("No HF token found, central signaling relay disabled")
+            return
+
+        try:
+            from reachy_mini.media.central_signaling_relay import start_central_relay
+
+            self.logger.info("Starting central signaling relay...")
+            await start_central_relay(
+                hf_token=hf_token,
+                robot_name=self.robot_name,
+            )
+            self.logger.info("Central signaling relay started")
+        except Exception as e:
+            self.logger.warning(f"Failed to start central signaling relay: {e}")
+
+    async def _stop_central_signaling_relay(self) -> None:
+        """Stop the central signaling relay."""
+        try:
+            from reachy_mini.media.central_signaling_relay import stop_central_relay
+
+            await stop_central_relay()
+            self.logger.info("Central signaling relay stopped")
+        except Exception as e:
+            self.logger.debug(f"Error stopping central signaling relay: {e}")
 
     async def start(
         self,
         sim: bool = False,
+        mockup_sim: bool = False,
         serialport: str = "auto",
         scene: str = "empty",
         localhost_only: bool = True,
@@ -79,12 +152,14 @@ class Daemon:
         check_collision: bool = False,
         kinematics_engine: str = "AnalyticalKinematics",
         headless: bool = False,
+        use_audio: bool = True,
         hardware_config_filepath: str | None = None,
     ) -> "DaemonState":
         """Start the Reachy Mini daemon.
 
         Args:
             sim (bool): If True, run in simulation mode using Mujoco. Defaults to False.
+            mockup_sim (bool): If True, run in lightweight simulation mode (no MuJoCo). Defaults to False.
             serialport (str): Serial port for real motors. Defaults to "auto", which will try to find the port automatically.
             scene (str): Name of the scene to load in simulation mode ("empty" or "minimal"). Defaults to "empty".
             localhost_only (bool): If True, restrict the server to localhost only clients. Defaults to True.
@@ -92,6 +167,7 @@ class Daemon:
             check_collision (bool): If True, enable collision checking. Defaults to False.
             kinematics_engine (str): Kinematics engine to use. Defaults to "AnalyticalKinematics".
             headless (bool): If True, run Mujoco in headless mode (no GUI). Defaults to False.
+            use_audio (bool): If True, enable audio. Defaults to True.
             hardware_config_filepath (str | None): Path to the hardware configuration YAML file. Defaults to None.
 
         Returns:
@@ -103,18 +179,23 @@ class Daemon:
             return self._status.state
 
         self.logger.info(
-            f"Daemon start parameters: sim={sim}, serialport={serialport}, scene={scene}, localhost_only={localhost_only}, wake_up_on_start={wake_up_on_start}, check_collision={check_collision}, kinematics_engine={kinematics_engine}, headless={headless}, hardware_config_filepath={hardware_config_filepath}"
+            f"Daemon start parameters: sim={sim}, mockup_sim={mockup_sim}, serialport={serialport}, scene={scene}, localhost_only={localhost_only}, wake_up_on_start={wake_up_on_start}, check_collision={check_collision}, kinematics_engine={kinematics_engine}, headless={headless}, hardware_config_filepath={hardware_config_filepath}"
         )
 
+        # mockup-sim behaves exactly like a real robot for apps (they open webcam directly)
+        # Only MuJoCo (--sim) sets simulation_enabled=True (streams video via UDP)
         self._status.simulation_enabled = sim
+        self._status.mockup_sim_enabled = mockup_sim
 
         if not localhost_only:
             self._status.wlan_ip = get_ip_address()
 
         self._start_params = {
             "sim": sim,
+            "mockup_sim": mockup_sim,
             "serialport": serialport,
             "headless": headless,
+            "use_audio": use_audio,
             "scene": scene,
             "localhost_only": localhost_only,
         }
@@ -126,11 +207,13 @@ class Daemon:
             self.backend = self._setup_backend(
                 wireless_version=self.wireless_version,
                 sim=sim,
+                mockup_sim=mockup_sim,
                 serialport=serialport,
                 scene=scene,
                 check_collision=check_collision,
                 kinematics_engine=kinematics_engine,
                 headless=headless,
+                use_audio=use_audio,
                 hardware_config_filepath=hardware_config_filepath,
             )
         except Exception as e:
@@ -138,9 +221,12 @@ class Daemon:
             self._status.error = str(e)
             raise e
 
-        self.server = ZenohServer(self.backend, localhost_only=localhost_only)
-        self.server.start()
-
+        self.zenoh_server = ZenohServer(
+            prefix=self.robot_name,
+            backend=self.backend,
+            localhost_only=localhost_only,
+        )
+        self.zenoh_server.start()
         self._thread_publish_status = Thread(target=self._publish_status, daemon=True)
         self._thread_publish_status.start()
 
@@ -155,7 +241,7 @@ class Daemon:
                 self.logger.error(f"Backend encountered an error: {e}")
                 self._status.state = DaemonState.ERROR
                 self._status.error = str(e)
-                self.server.stop()
+                self.zenoh_server.stop()
                 self.backend = None
 
         self.backend_run_thread = Thread(target=backend_wrapped_run)
@@ -188,7 +274,11 @@ class Daemon:
             await asyncio.sleep(
                 0.2
             )  # Give some time for the backend to release the audio device
+            self.backend.setup_webrtc_interface(self._webrtc)
             self._webrtc.start()
+
+            # Start central signaling relay for remote WebRTC access
+            await self._start_central_signaling_relay()
 
         self.logger.info("Daemon started successfully.")
         self._status.state = DaemonState.RUNNING
@@ -221,10 +311,12 @@ class Daemon:
             self._status.state = DaemonState.STOPPING
             self.backend.is_shutting_down = True
             self._thread_event_publish_status.set()
-            self.server.stop()
 
             if self._webrtc:
-                self._webrtc.stop()
+                # We use pause() instead of stop() to keep the signalling server running and the producer registered, allowing proper restart.
+                self._webrtc.pause()
+                # Stop the central signaling relay
+                await self._stop_central_signaling_relay()
 
             if goto_sleep_on_stop:
                 try:
@@ -249,6 +341,9 @@ class Daemon:
             self.backend.close()
             self.backend.ready.clear()
 
+            # zenoh server must be closed after backend finishes to publish all data
+            self.zenoh_server.stop()
+
             if self._status.state != DaemonState.ERROR:
                 self.logger.info("Daemon stopped successfully.")
                 self._status.state = DaemonState.STOPPED
@@ -271,9 +366,11 @@ class Daemon:
     async def restart(
         self,
         sim: Optional[bool] = None,
+        mockup_sim: Optional[bool] = None,
         serialport: Optional[str] = None,
         scene: Optional[str] = None,
         headless: Optional[bool] = None,
+        use_audio: Optional[bool] = None,
         localhost_only: Optional[bool] = None,
         wake_up_on_start: Optional[bool] = None,
         goto_sleep_on_stop: Optional[bool] = None,
@@ -282,9 +379,11 @@ class Daemon:
 
         Args:
             sim (bool): If True, run in simulation mode using Mujoco. Defaults to None (uses the previous value).
+            mockup_sim (bool): If True, run in lightweight simulation mode (no MuJoCo). Defaults to None (uses the previous value).
             serialport (str): Serial port for real motors. Defaults to None (uses the previous value).
             scene (str): Name of the scene to load in simulation mode ("empty" or "minimal"). Defaults to None (uses the previous value).
             headless (bool): If True, run Mujoco in headless mode (no GUI). Defaults to None (uses the previous value).
+            use_audio (bool): If True, enable audio. Defaults to None (uses the previous value).
             localhost_only (bool): If True, restrict the server to localhost only clients. Defaults to None (uses the previous value).
             wake_up_on_start (bool): If True, wake up Reachy Mini on start. Defaults to None (don't wake up).
             goto_sleep_on_stop (bool): If True, put Reachy Mini to sleep on stop. Defaults to None (don't go to sleep).
@@ -307,6 +406,9 @@ class Daemon:
             )
             params: dict[str, Any] = {
                 "sim": sim if sim is not None else self._start_params["sim"],
+                "mockup_sim": mockup_sim
+                if mockup_sim is not None
+                else self._start_params["mockup_sim"],
                 "serialport": serialport
                 if serialport is not None
                 else self._start_params["serialport"],
@@ -314,6 +416,9 @@ class Daemon:
                 "headless": headless
                 if headless is not None
                 else self._start_params["headless"],
+                "use_audio": use_audio
+                if use_audio is not None
+                else self._start_params["use_audio"],
                 "localhost_only": localhost_only
                 if localhost_only is not None
                 else self._start_params["localhost_only"],
@@ -351,12 +456,13 @@ class Daemon:
             json_str = json.dumps(
                 asdict(self.status(), dict_factory=convert_enum_to_dict)
             )
-            self.server.pub_status.put(json_str)
+            self.zenoh_server.pub_status.put(json_str)
             time.sleep(1)
 
     async def run4ever(
         self,
         sim: bool = False,
+        mockup_sim: bool = False,
         serialport: str = "auto",
         scene: str = "empty",
         localhost_only: bool = True,
@@ -365,6 +471,7 @@ class Daemon:
         check_collision: bool = False,
         kinematics_engine: str = "AnalyticalKinematics",
         headless: bool = False,
+        use_audio: bool = True,
     ) -> None:
         """Run the Reachy Mini daemon indefinitely.
 
@@ -372,6 +479,7 @@ class Daemon:
 
         Args:
             sim (bool): If True, run in simulation mode using Mujoco. Defaults to False.
+            mockup_sim (bool): If True, run in lightweight simulation mode (no MuJoCo). Defaults to False.
             serialport (str): Serial port for real motors. Defaults to "auto", which will try to find the port automatically.
             scene (str): Name of the scene to load in simulation mode ("empty" or "minimal"). Defaults to "empty".
             localhost_only (bool): If True, restrict the server to localhost only clients. Defaults to True.
@@ -380,10 +488,12 @@ class Daemon:
             check_collision (bool): If True, enable collision checking. Defaults to False.
             kinematics_engine (str): Kinematics engine to use. Defaults to "AnalyticalKinematics".
             headless (bool): If True, run Mujoco in headless mode (no GUI). Defaults to False.
+            use_audio (bool): If True, enable audio. Defaults to True.
 
         """
         await self.start(
             sim=sim,
+            mockup_sim=mockup_sim,
             serialport=serialport,
             scene=scene,
             localhost_only=localhost_only,
@@ -391,6 +501,7 @@ class Daemon:
             check_collision=check_collision,
             kinematics_engine=kinematics_engine,
             headless=headless,
+            use_audio=use_audio,
         )
 
         if self._status.state == DaemonState.RUNNING:
@@ -416,19 +527,29 @@ class Daemon:
         self,
         wireless_version: bool,
         sim: bool,
+        mockup_sim: bool,
         serialport: str,
         scene: str,
         check_collision: bool,
         kinematics_engine: str,
         headless: bool,
+        use_audio: bool,
         hardware_config_filepath: str | None = None,
-    ) -> "RobotBackend | MujocoBackend":
-        if sim:
+        reflash_motors_on_start: bool = True,
+    ) -> "RobotBackend | MujocoBackend | MockupSimBackend":
+        if mockup_sim:
+            return MockupSimBackend(
+                check_collision=check_collision,
+                kinematics_engine=kinematics_engine,
+                use_audio=use_audio,
+            )
+        elif sim:
             return MujocoBackend(
                 scene=scene,
                 check_collision=check_collision,
                 kinematics_engine=kinematics_engine,
                 headless=headless,
+                use_audio=use_audio,
             )
         else:
             if serialport == "auto":
@@ -452,11 +573,17 @@ class Daemon:
             self.logger.info(
                 f"Creating RobotBackend with parameters: serialport={serialport}, check_collision={check_collision}, kinematics_engine={kinematics_engine}"
             )
+
+            if reflash_motors_on_start:
+                reflash_motors_if_needed(serialport, dont_light_up=True)
+
             return RobotBackend(
                 serialport=serialport,
                 log_level=self.log_level,
                 check_collision=check_collision,
                 kinematics_engine=kinematics_engine,
+                use_audio=use_audio,
+                wireless_version=wireless_version,
                 hardware_config_filepath=hardware_config_filepath,
             )
 
@@ -476,10 +603,15 @@ class DaemonState(Enum):
 class DaemonStatus:
     """Dataclass representing the status of the Reachy Mini daemon."""
 
+    robot_name: str
     state: DaemonState
     wireless_version: bool
+    desktop_app_daemon: bool
     simulation_enabled: Optional[bool]
-    backend_status: Optional[RobotBackendStatus | MujocoBackendStatus]
+    mockup_sim_enabled: Optional[bool]
+    backend_status: Optional[
+        RobotBackendStatus | MujocoBackendStatus | MockupSimBackendStatus
+    ]
     error: Optional[str] = None
     wlan_ip: Optional[str] = None
     version: Optional[str] = None

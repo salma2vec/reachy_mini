@@ -1,6 +1,7 @@
 """Common pydantic models definitions."""
 
 from datetime import datetime
+from typing import cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -36,24 +37,27 @@ class Matrix4x4Pose(BaseModel):
     def from_pose_array(cls, arr: NDArray[np.float64]) -> "Matrix4x4Pose":
         """Create a Matrix4x4 pose representation from a 4x4 pose array."""
         assert arr.shape == (4, 4), "Array must be of shape (4, 4)"
-        m: tuple[
-            float,
-            float,
-            float,
-            float,
-            float,
-            float,
-            float,
-            float,
-            float,
-            float,
-            float,
-            float,
-            float,
-            float,
-            float,
-            float,
-        ] = tuple(arr.flatten().tolist())  # type: ignore [assignment]
+        m = cast(
+            tuple[
+                float,
+                float,
+                float,
+                float,
+                float,
+                float,
+                float,
+                float,
+                float,
+                float,
+                float,
+                float,
+                float,
+                float,
+                float,
+                float,
+            ],
+            tuple(arr.flatten().tolist()),
+        )
         return cls(m=m)
 
     def to_pose_array(self) -> NDArray[np.float64]:
@@ -137,6 +141,13 @@ class FullBodyTarget(BaseModel):
     }
 
 
+class DoAInfo(BaseModel):
+    """Direction of Arrival info from the microphone array."""
+
+    angle: float  # Angle in radians (0=left, π/2=front, π=right)
+    speech_detected: bool
+
+
 class FullState(BaseModel):
     """Represent the full state of the robot including all joint positions and poses."""
 
@@ -147,3 +158,4 @@ class FullState(BaseModel):
     antennas_position: list[float] | None = None
     timestamp: datetime | None = None
     passive_joints: list[float] | None = None
+    doa: DoAInfo | None = None

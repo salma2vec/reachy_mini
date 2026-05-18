@@ -1,15 +1,15 @@
-"""Allows tuning of the XMOS XVF3800 chip.
+"""Allows tuning of the XMOS XVF3800 chip integrated in the Reachy Mini Audio card.
 
 Example usage:
 
     # Read a parameter
-    python reachy_host.py AUDIO_MGR_OP_L
+    python audio_control_utils.py AUDIO_MGR_OP_L
     # Output:
     # ReadCMD: cmdid: 143, resid: 35, response: array('B', [0, 8, 0])
     # AUDIO_MGR_OP_L: [0, 8, 0]
 
     # Write a parameter
-    python reachy_host.py AUDIO_MGR_OP_L --values 3 0
+    python audio_control_utils.py AUDIO_MGR_OP_L --values 3 0
     # Output:
     # Writing to AUDIO_MGR_OP_L with values: [3, 0]
     # WriteCMD: cmdid: 15, resid: 35, payload: [3, 0]
@@ -290,7 +290,7 @@ class ReSpeaker:
                 raise ValueError("Unknown status code: {}".format(response[0]))
             time.sleep(0.01)
 
-        logging.info(
+        logging.debug(
             "ReadCMD: cmdid: {}, resid: {}, response: {}".format(
                 wvalue, windex, response
             )
@@ -320,8 +320,37 @@ class ReSpeaker:
 
 
 def find(vid: int = 0x2886, pid: int = 0x001A) -> ReSpeaker | None:
-    """Find and return the ReSpeaker USB device with the given Vendor ID and Product ID."""
-    dev = usb.core.find(idVendor=vid, idProduct=pid)
+    """Find and return the ReSpeaker USB device with the given Vendor ID and Product ID.
+
+    Args:
+        vid (int): USB Vendor ID to search for. Default: 0x2886 (XMOS).
+        pid (int): USB Product ID to search for. Default: 0x001A (XMOS XVF3800).
+
+    Returns:
+        ReSpeaker | None: A ReSpeaker object if the device is found,
+                         None otherwise.
+
+    Note:
+        This function searches for USB devices with the specified Vendor ID
+        and Product ID using libusb backend. The default values target
+        XMOS XVF3800 devices used in ReSpeaker microphone arrays.
+
+    Example:
+        ```python
+        from reachy_mini.media.audio_control_utils import find
+
+        # Find default ReSpeaker device
+        respeaker = find()
+        if respeaker is not None:
+            print("Found ReSpeaker device")
+            respeaker.close()
+
+        # Find specific device
+        custom_device = find(vid=0x1234, pid=0x5678)
+        ```
+
+    """
+    dev = usb.core.find(idVendor=vid, idProduct=pid, backend=get_libusb1_backend())
     if not dev:
         return None
 
@@ -329,24 +358,61 @@ def find(vid: int = 0x2886, pid: int = 0x001A) -> ReSpeaker | None:
 
 
 def init_respeaker_usb() -> Optional[ReSpeaker]:
-    """Initialize the ReSpeaker USB device. Looks for both new and beta device IDs."""
+    """Initialize the ReSpeaker USB device. Looks for both new and beta device IDs.
+
+    Returns:
+        Optional[ReSpeaker]: A ReSpeaker object if a compatible device is found,
+                           None otherwise.
+
+    Note:
+        This function attempts to initialize a ReSpeaker microphone array by
+        searching for USB devices with known Vendor and Product IDs. It tries:
+        1. New Reachy Mini Audio firmware (0x38FB:0x1001) - preferred
+        2. Old ReSpeaker firmware (0x2886:0x001A) - with warning to update
+
+        The function handles USB backend errors gracefully and returns
+        None if no compatible device is found or if initialization fails.
+
+    Example:
+        ```python
+        from reachy_mini.media.audio_control_utils import init_respeaker_usb
+
+        # Initialize ReSpeaker device
+        respeaker = init_respeaker_usb()
+        if respeaker is not None:
+            print("ReSpeaker initialized successfully")
+            # Use the device...
+            doa = respeaker.read("DOA_VALUE_RADIANS")
+            respeaker.close()
+        else:
+            print("No ReSpeaker device found")
+        ```
+
+    """
     try:
+        # Try new firmware first
         dev = usb.core.find(
             idVendor=0x38FB, idProduct=0x1001, backend=get_libusb1_backend()
         )
+
+        # If not found, try old firmware
         if dev is None:
             dev = usb.core.find(
                 idVendor=0x2886, idProduct=0x001A, backend=get_libusb1_backend()
             )
-            if dev is None:
-                logging.error("No ReSpeaker USB device found !")
-                return None 
-            else:
-                logging.warning("Old firmware detected on ReSpeaker USB device. Please update the firmware!")
+            if dev is not None:
+                logging.warning("Old firmware detected. Please update the firmware!")
+
+        # If still not found, raise error
+        if dev is None:
+            logging.error("No Reachy Mini Audio USB device found!")
+            return None
+
         return ReSpeaker(dev)
+
     except usb.core.NoBackendError:
         logging.error(
-            "No USB backend was found ! Make sure libusb_package is correctly installed with `pip install libusb_package`."
+            "No USB backend was found! Make sure libusb_package is correctly installed with `pip install libusb_package`."
         )
         return None
 
@@ -382,7 +448,12 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    dev = find(vid=args.vid, pid=args.pid)
+    # Allow user overrides if provided, else use known defaults
+    if args.vid is not None and args.pid is not None:
+        dev = find(vid=args.vid, pid=args.pid)
+    else:
+        dev = init_respeaker_usb()
+
     if not dev:
         print("No device found")
         sys.exit(1)
@@ -418,7 +489,22 @@ def main() -> None:
             print(f"{args.command}: {result}")
 
     except Exception as e:
-        print(f"Error executing command {args.command}: {e}")
+        error_msg = f"Error executing command {args.command}: {e}"
+        print(error_msg)
+
+        # Check if it's a permission error, so far only seen on Linux
+        if (
+            "Errno 13" in str(e)
+            or "Access denied" in str(e)
+            or "insufficient permissions" in str(e)
+        ):
+            print("\nThis looks like a permissions error.")
+            print(
+                "\n - You are most likely on Linux and need to adjust udev rules for USB permissions."
+            )
+            print(
+                "\n - If you are not on Linux or have additional questions contact the team."
+            )
         sys.exit(1)
     finally:
         dev.close()

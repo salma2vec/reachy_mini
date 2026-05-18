@@ -30,15 +30,12 @@ SLEEP_HEAD_POSE = np.array(
 class AnalyticalKinematics:
     """Reachy Mini Analytical Kinematics class, implemented in Rust with python bindings."""
 
-    def __init__(
-        self, 
-        automatic_body_yaw: bool = True
-        ) -> None:
+    def __init__(self, automatic_body_yaw: bool = True) -> None:
         """Initialize."""
         assets_root_path: str = str(files(reachy_mini).joinpath("assets/"))
         data_path = assets_root_path + "/kinematics_data.json"
         data = json.load(open(data_path, "rb"))
-        
+
         self.automatic_body_yaw = automatic_body_yaw
 
         self.head_z_offset = data["head_z_offset"]
@@ -60,7 +57,7 @@ class AnalyticalKinematics:
         # TODO test with init head pose instead of sleep pose
         sleep_head_pose = SLEEP_HEAD_POSE.copy()
         sleep_head_pose[:3, 3][2] += self.head_z_offset
-        self.kin.reset_forward_kinematics(sleep_head_pose)  # type: ignore[arg-type]
+        self.kin.reset_forward_kinematics(sleep_head_pose.tolist())
 
         self.logger = logging.getLogger(__name__)
         # self.logger.setLevel(logging.WARNING)
@@ -81,18 +78,20 @@ class AnalyticalKinematics:
 
         reachy_joints = []
         if self.automatic_body_yaw:
-            # inverse kinematics solution that modulates the body yaw to 
-            # stay within the mechanical limits (max_body_yaw) 
+            # inverse kinematics solution that modulates the body yaw to
+            # stay within the mechanical limits (max_body_yaw)
             # additionally it makes sure the the relative yaw between the body and the head
             # stays within the mechanical limits (max_relative_yaw)
-            reachy_joints = self.kin.inverse_kinematics_safe(_pose,  # type: ignore[arg-type]
-                                                            body_yaw = body_yaw, 
-                                                            max_relative_yaw = np.deg2rad(65), 
-                                                            max_body_yaw = np.deg2rad(160))  
+            reachy_joints = self.kin.inverse_kinematics_safe(
+                _pose.tolist(),
+                body_yaw=body_yaw,
+                max_relative_yaw=np.deg2rad(65),
+                max_body_yaw=np.deg2rad(160),
+            )
         else:
             # direct inverse kinematics solution with given body yaw
             # it does not modify the body yaw
-            stewart_joints = self.kin.inverse_kinematics(_pose, body_yaw)  # type: ignore[arg-type]
+            stewart_joints = self.kin.inverse_kinematics(_pose.tolist(), body_yaw)
             reachy_joints = [body_yaw] + stewart_joints
 
         return np.array(reachy_joints)
@@ -141,7 +140,7 @@ class AnalyticalKinematics:
         T_world_platform[:3, 3][2] -= self.head_z_offset
 
         return T_world_platform
-    
+
     def set_automatic_body_yaw(self, automatic_body_yaw: bool) -> None:
         """Set the automatic body yaw.
 
